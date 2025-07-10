@@ -1,10 +1,13 @@
 ﻿using OFT.Localization;
 using OFT.Rendering.Context;
+using OFT.Rendering.Control;
 using OFT.Rendering.Settings;
+using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Drawing;
+using System.Threading;
 using System.Threading.Tasks;
 using Utils.Common;
 
@@ -15,27 +18,64 @@ public class RolloverLines : Indicator
 {
     #region Fields
 
-    private readonly ConcurrentDictionary<int, string> _barContracts = [];
+    private readonly ConcurrentDictionary<int, (string, DateTime)> _barContracts = [];
 
     private ContractRolloversDescription? _rollovers;
     private int _lastBar = -1;
-    private bool _loading;
+    private int _loading;
+    private bool _isInitialized;
+    private int _barUnderMouse;
+    private Point _lastMousePosition;
+
+    private FilterEnum<RolloverType> _rolloverType;
 
     #endregion
 
     #region Properties
 
+    #region Settings
+
+    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.RolloverType), GroupName = nameof(Strings.Settings))]
+    public FilterEnum<RolloverType> RolloverType 
+    { 
+        get => _rolloverType;
+        set => SetTrackedProperty(ref _rolloverType, value, (name) =>
+        {
+            if (name == nameof(RolloverType.Value))
+                SetRolloversAsync().ObserveException();
+        });
+    }
+
+    #endregion
+
+    #region Drawing
+
     [Display(ResourceType = typeof(Strings), Name = nameof(Strings.LineSettings), GroupName = nameof(Strings.Drawing),
        Description = nameof(Strings.LineSettingsDescription))]
     public PenSettings LineSettings { get; set; }
 
-    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.Font), GroupName = nameof(Strings.Drawing),
+    #endregion
+
+    #region Labels
+
+    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.ShowLabelsOfFinishedLines), GroupName = nameof(Strings.Label),
+     Description = nameof(Strings.ShowLabelsOfFinishedLinesDescription))]
+    public bool ShowLabels { get; set; } = true;
+
+    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.Font), GroupName = nameof(Strings.Label),
        Description = nameof(Strings.FontSettingDescription))]
     public FontSetting FontSetting { get; set; }
 
-    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.ShowLabelsOfFinishedLines), GroupName = nameof(Strings.Drawing),
-     Description = nameof(Strings.ShowLabelsOfFinishedLinesDescription))]
-    public bool ShowLabels { get; set; } = true;
+    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.OffsetX), GroupName = nameof(Strings.Label),
+    Description = nameof(Strings.LabelOffsetXDescription))]
+    public int LabelOffsetX { get; set; } = 5;
+
+    [Range(0, int.MaxValue)]
+    [Display(ResourceType = typeof(Strings), Name = nameof(Strings.OffsetY), GroupName = nameof(Strings.Label),
+    Description = nameof(Strings.LabelOffsetYDescription))]
+    public int LabelOffsetY { get; set; } = 5;
+
+    #endregion
 
     #endregion
 
@@ -44,40 +84,42 @@ public class RolloverLines : Indicator
     public RolloverLines() : base(true)
     {
         EnableCustomDrawing = true;
-        SubscribeToDrawingEvents(DrawingLayouts.Historical);
+        SubscribeToDrawingEvents(DrawingLayouts.Final);
         DenyToChangePanel = true;
 
         var data = DataSeries[0] as ValueDataSeries;
         data.IsHidden = true;
         data.ShowZeroValue = false;
 
-        FontSetting = new();
+        FontSetting = new("Segoe UI", 9);
         LineSettings = new()
         {
             Color = CrossColors.Red,
             Width = 2,
             LineDashStyle = LineDashStyle.Dash
         };
+
+        RolloverType = new FilterEnum<RolloverType>(false) { Enabled = true };
     }
 
     #endregion
 
     #region Protected methods
 
-    protected override void OnRecalculate()
+    protected override void OnInitialize()
     {
-        _barContracts.Clear();
-        _lastBar = -1;
-       
+        _isInitialized = true;
         SetRolloversAsync().ObserveException();
     }
 
     protected override void OnCalculate(int bar, decimal value)
     {
-        if (bar == _lastBar || bar < CurrentBar - 1) 
+        if (bar == _lastBar) 
             return;
 
-        if(IsNewSession(bar))
+        _lastBar = bar;
+
+        if (IsNewSession(bar) && bar == CurrentBar - 1) 
             SetRolloversAsync().ObserveException();
     }
 
@@ -89,40 +131,56 @@ public class RolloverLines : Indicator
         DrawRollovers(context);
     }
 
+    public override bool ProcessMouseMove(RenderControlMouseEventArgs e)
+    {
+        _barUnderMouse = ChartInfo.MouseLocationInfo.BarBelowMouse;
+        _lastMousePosition = ChartInfo.MouseLocationInfo.LastPosition;
+
+        return base.ProcessMouseMove(e);
+    }
+
     #endregion
 
     #region Private methods
 
     private async Task SetRolloversAsync()
     {
-        if (_loading)
+        if (!_isInitialized || Interlocked.CompareExchange(ref _loading, 1, 0) != 0)
             return;
 
-        _loading = true;
-
-        _rollovers = await DataProvider.OnlineDataProvider.GetRolloversAsync(GetCandle(0).Time, GetCandle(CurrentBar - 1).LastTime, RolloverType.Atas);
-
-        _loading = false;
-
-        if (_rollovers is null || _rollovers.Rollovers.Length == 0)
-            return;
-
-        for (int bar = 0; bar < CurrentBar; bar++) 
+        try
         {
-            var candle = GetCandle(bar);
-            var time1 = candle.Time;
-            var time2 = bar == CurrentBar - 1 ? candle.LastTime : GetCandle(bar + 1).Time;
+            RolloverType.SetEnabled(false);
+            _rollovers = await DataProvider?.OnlineDataProvider?.GetRolloversAsync(GetCandle(0).Time, GetCandle(CurrentBar - 1).LastTime, RolloverType.Value);
 
-            foreach (var (Code, Rollover) in _rollovers.Rollovers)
+            if (_rollovers is null || _rollovers.Rollovers.Length == 0)
+                return;
+
+            _barContracts.Clear();
+
+            for (int bar = 0; bar < CurrentBar; bar++)
             {
-                if (Rollover >= time1 && Rollover <= time2)
+                var candle = GetCandle(bar);
+                var time1 = candle.Time;
+                var time2 = bar == CurrentBar - 1 ? candle.LastTime : GetCandle(bar + 1).Time;
+
+                foreach (var (Code, Rollover) in _rollovers.Rollovers)
                 {
-                    _barContracts[bar] = Code;
+                    if (Rollover >= time1 && Rollover <= time2)
+                    {
+                        _barContracts[bar] = (Code, Rollover);
+                        break;
+                    }
                 }
             }
-        }
 
-        RedrawChart();
+            RedrawChart();
+        }
+        finally 
+        {
+            Interlocked.Exchange(ref _loading, 0);
+            DoActionInGuiThread(() => RolloverType.SetEnabled(true));
+        }   
     }
 
     private void DrawRollovers(RenderContext context)
@@ -132,7 +190,7 @@ public class RolloverLines : Indicator
 
         for (var bar = FirstVisibleBarNumber; bar <= LastVisibleBarNumber; bar++) 
         {
-            if (!CheckBar(bar) || !_barContracts.TryGetValue(bar, out string code))
+            if (!CheckBar(bar) || !_barContracts.TryGetValue(bar, out (string, DateTime) item))
                 continue;
 
             var x = ChartInfo.GetXByBar(bar, false);
@@ -140,51 +198,34 @@ public class RolloverLines : Indicator
             var bottom = ChartInfo.Region.Bottom;
 
             context.DrawLine(LineSettings.RenderObject, x, top, x, bottom);
-
-            if(ShowLabels)
+            
+            if (ShowLabels)
             {
-                var shift = 5;
-                var text = $"{ParseContractExpiration(code)} (LIQ)";
-                context.DrawString(text, FontSetting.RenderObject, LineSettings.Color.Convert(), x + shift, top + 10);
+                string text;
+
+                if (ToDrawTimeLabel(bar, x))
+                {
+                    var time = item.Item2.AddHours(InstrumentInfo?.TimeZone ?? 0);
+                    text = $"{item.Item1} ({time:dd.MM.yyyy HH:mm})";
+                }
+                else
+                    text = item.Item1;
+
+                var xPosition = x + LabelOffsetX;
+                var yPosition = top + LabelOffsetY;
+                context.DrawString(text, FontSetting.RenderObject, LineSettings.Color.Convert(), xPosition, yPosition);
             }
         }
     }
 
-    public static string ParseContractExpiration(string contractCode)
+    private bool ToDrawTimeLabel(int bar, int x)
     {
-        if (string.IsNullOrWhiteSpace(contractCode) || contractCode.Length < 3)
-            return null;
+        if (ChartInfo?.PriceChartContainer.BarsWidth > 5)
+            return bar == _barUnderMouse;
 
-        char monthCode = contractCode[^2];
-        char yearCode = contractCode[^1];
-
-        var monthMap = new Dictionary<char, int>
-        {
-            ['F'] = 1,
-            ['G'] = 2,
-            ['H'] = 3,
-            ['J'] = 4,
-            ['K'] = 5,
-            ['M'] = 6,
-            ['N'] = 7,
-            ['Q'] = 8,
-            ['U'] = 9,
-            ['V'] = 10,
-            ['X'] = 11,
-            ['Z'] = 12
-        };
-
-        if (!monthMap.TryGetValue(monthCode, out int month))
-            return null;
-
-        if (!char.IsDigit(yearCode))
-            return null;
-
-        int yearShort = yearCode - '0'; 
-
-        return $"{month:00} {yearShort:00}";
+        var shift = 5;
+        return _lastMousePosition.X >= x - shift && _lastMousePosition.X <= x + shift;
     }
-
 
     private bool CheckBar(int bar)
     {
