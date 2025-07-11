@@ -161,20 +161,18 @@ public class RolloverLines : Indicator
 
             for (int bar = 0; bar < CurrentBar; bar++)
             {
+                if(index >= _rollovers.Rollovers.Length)
+                    break;
+
                 var candle = GetCandle(bar);
                 var time1 = candle.Time;
                 var time2 = bar == CurrentBar - 1 ? candle.LastTime : GetCandle(bar + 1).Time;
+                var (code, rollover) = _rollovers.Rollovers[index];
 
-                for (var i = index; i < _rollovers.Rollovers.Length; i++) 
+                if (rollover >= time1 && rollover <= time2)
                 {
-                    var (code, rollover) = _rollovers.Rollovers[i];
-
-                    if (rollover >= time1 && rollover <= time2)
-                    {
-                        _barContracts[bar] = (code, rollover);
-                        index++;
-                        break;
-                    }
+                    _barContracts[bar] = (code, rollover);
+                    index++;
                 }
             }
 
