@@ -1,33 +1,34 @@
-﻿using OFT.Localization;
-using OFT.Rendering.Context;
-using OFT.Rendering.Control;
-using OFT.Rendering.Settings;
+﻿namespace ATAS.Indicators.Technical;
+
 using System;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Drawing;
 using System.Threading;
-using System.Threading.Tasks;
-using Utils.Common;
 
-namespace ATAS.Indicators.Technical;
+using OFT.Attributes;
+using OFT.Localization;
+using OFT.Rendering.Context;
+using OFT.Rendering.Control;
+using OFT.Rendering.Settings;
 
-[DisplayName("Rollover Lines")]
-public class RolloverLines : Indicator
+using Utils.Common.Logging;
+
+[DisplayName("Rollover Dates")]
+public class RolloverDates : Indicator
 {
     #region Fields
 
-    private readonly ConcurrentDictionary<int, (string, DateTime)> _barContracts = [];
+    private readonly ConcurrentDictionary<int, ContractRollover> _barContracts = [];
 
-    private ContractRolloversDescription? _rollovers;
     private int _lastBar = -1;
     private int _loading;
     private bool _isInitialized;
     private int _barUnderMouse;
     private Point _lastMousePosition;
 
-    private FilterEnum<RolloverType> _rolloverType;
+    private FilterEnum<ContractRolloverType> _rolloverType;
 
     #endregion
 
@@ -36,13 +37,14 @@ public class RolloverLines : Indicator
     #region Settings
 
     [Display(ResourceType = typeof(Strings), Name = nameof(Strings.RolloverType), GroupName = nameof(Strings.Settings))]
-    public FilterEnum<RolloverType> RolloverType 
+    [Parameter]
+    public FilterEnum<ContractRolloverType> RolloverType 
     { 
         get => _rolloverType;
         set => SetTrackedProperty(ref _rolloverType, value, (name) =>
         {
-            if (name == nameof(RolloverType.Value))
-                SetRolloversAsync().ObserveException();
+	        if (name == nameof(RolloverType.Value))
+		        RefreshContractRolloversAsync();
         });
     }
 
@@ -81,15 +83,15 @@ public class RolloverLines : Indicator
 
     #region ctor
 
-    public RolloverLines() : base(true)
+    public RolloverDates() : base(true)
     {
         EnableCustomDrawing = true;
         SubscribeToDrawingEvents(DrawingLayouts.Final);
         DenyToChangePanel = true;
 
         var data = DataSeries[0] as ValueDataSeries;
-        data.IsHidden = true;
-        data.ShowZeroValue = false;
+        data!.IsHidden = true;
+        data!.ShowZeroValue = false;
 
         FontSetting = new("Segoe UI", 9);
         LineSettings = new()
@@ -99,17 +101,22 @@ public class RolloverLines : Indicator
             LineDashStyle = LineDashStyle.Dash
         };
 
-        RolloverType = new FilterEnum<RolloverType>(false) { Enabled = true };
+        RolloverType = new FilterEnum<ContractRolloverType>(false)
+        {
+	        Enabled = true,
+            Value = ContractRolloverType.VolumeBasedCurrentEnd,
+        };
+		RolloverType.PropertyChanged += OnRolloverTypePropertyChanged;
     }
 
-    #endregion
+	#endregion
 
-    #region Protected methods
+	#region Protected methods
 
-    protected override void OnInitialize()
+	protected override void OnInitialize()
     {
         _isInitialized = true;
-        SetRolloversAsync().ObserveException();
+        RefreshContractRolloversAsync();
     }
 
     protected override void OnCalculate(int bar, decimal value)
@@ -119,8 +126,8 @@ public class RolloverLines : Indicator
 
         _lastBar = bar;
 
-        if (IsNewSession(bar) && bar == CurrentBar - 1) 
-            SetRolloversAsync().ObserveException();
+        if (IsNewSession(bar) && bar == CurrentBar - 1)
+	        RefreshContractRolloversAsync();
     }
 
     protected override void OnRender(RenderContext context, DrawingLayouts layout)
@@ -143,56 +150,64 @@ public class RolloverLines : Indicator
 
     #region Private methods
 
-    private async Task SetRolloversAsync()
+    private async void RefreshContractRolloversAsync()
     {
-        if (!_isInitialized || Interlocked.CompareExchange(ref _loading, 1, 0) != 0)
-            return;
+		try
+	    {
+		    if (!_isInitialized || Interlocked.CompareExchange(ref _loading, 1, 0) != 0)
+			    return;
 
-        try
-        {
-            RolloverType.SetEnabled(false);
-            _rollovers = await DataProvider?.OnlineDataProvider?.GetRolloversAsync(GetCandle(0).Time, GetCandle(CurrentBar - 1).LastTime, RolloverType.Value);
+			RolloverType.SetEnabled(false);
 
-            if (_rollovers is null || _rollovers.Rollovers.Length == 0)
-                return;
+		    var rollovers = await DataProvider?
+			    .OnlineDataProvider?
+			    .GetContractRolloversAsync(GetCandle(0).Time, GetCandle(CurrentBar - 1).LastTime, RolloverType.Value);
 
-            _barContracts.Clear();
-            var index = 0;
+		    if (rollovers is null || rollovers.Rollovers.Length == 0)
+			    return;
 
-            for (int bar = 0; bar < CurrentBar; bar++)
-            {
-                if(index >= _rollovers.Rollovers.Length)
-                    break;
+		    _barContracts.Clear();
 
-                var candle = GetCandle(bar);
-                var time1 = candle.Time;
-                var time2 = bar == CurrentBar - 1 ? candle.LastTime : GetCandle(bar + 1).Time;
-                var (code, rollover) = _rollovers.Rollovers[index];
+		    var index = 0;
 
-                if (rollover >= time1 && rollover <= time2)
-                {
-                    _barContracts[bar] = (code, rollover);
-                    index++;
-                }
-            }
+		    for (var bar = 0; bar < CurrentBar; bar++)
+		    {
+			    if (index >= rollovers.Rollovers.Length)
+				    break;
 
-            RedrawChart();
-        }
-        finally 
-        {
-            Interlocked.Exchange(ref _loading, 0);
-            DoActionInGuiThread(() => RolloverType.SetEnabled(true));
-        }   
+			    var candle = GetCandle(bar);
+			    var time1 = candle.LastTime;
+			    var time2 = bar == CurrentBar - 1 ? candle.LastTime : GetCandle(bar + 1).Time;
+			    var rollover = rollovers.Rollovers[index];
+
+			    if (rollover.Date > time1 && rollover.Date >= time2)
+				    continue;
+
+			    _barContracts[bar] = rollover;
+			    index++;
+		    }
+
+		    RedrawChart();
+		}
+	    catch (Exception excp)
+	    {
+		    this.LogError("Failed to get contract expirations.", excp);
+	    }
+	    finally
+	    {
+		    Interlocked.Exchange(ref _loading, 0);
+		    DoActionInGuiThread(() => RolloverType.SetEnabled(true));
+	    }
     }
 
     private void DrawRollovers(RenderContext context)
     {
-        if (_rollovers is null)
+        if (_barContracts.Count is 0)
             return;
 
         for (var bar = FirstVisibleBarNumber; bar <= LastVisibleBarNumber; bar++) 
         {
-            if (!CheckBar(bar) || !_barContracts.TryGetValue(bar, out (string, DateTime) item))
+            if (!CheckBar(bar) || !_barContracts.TryGetValue(bar, out var item))
                 continue;
 
             var x = ChartInfo.GetXByBar(bar, false);
@@ -200,22 +215,33 @@ public class RolloverLines : Indicator
             var bottom = ChartInfo.Region.Bottom;
 
             context.DrawLine(LineSettings.RenderObject, x, top, x, bottom);
-            
+
             if (ShowLabels)
             {
                 string text;
 
                 if (ToDrawTimeLabel(bar, x))
                 {
-                    var time = item.Item2.AddHours(InstrumentInfo?.TimeZone ?? 0);
-                    text = $"{item.Item1} ({time:dd.MM.yyyy HH:mm})";
+                    var time = item.Date.AddHours(InstrumentInfo?.TimeZone ?? 0);
+                    text = $"{item.Code} ({time:dd.MM.yyyy HH:mm})";
                 }
                 else
-                    text = item.Item1;
+                    text = item.Code;
 
-                var xPosition = x + LabelOffsetX;
+                var xPosition = x;
                 var yPosition = top + LabelOffsetY;
-                context.DrawString(text, FontSetting.RenderObject, LineSettings.Color.Convert(), xPosition, yPosition);
+
+                if (RolloverType.Value is ContractRolloverType.ExpirationDate or ContractRolloverType.VolumeBasedCurrentEnd)
+                {
+	                var textSize = context.MeasureString(text, FontSetting.RenderObject);
+
+	                xPosition -= textSize.Width;
+					xPosition -= LabelOffsetX;
+				}
+                else
+					xPosition += LabelOffsetX;
+
+				context.DrawString(text, FontSetting.RenderObject, LineSettings.Color.Convert(), xPosition, yPosition);
             }
         }
     }
@@ -232,7 +258,15 @@ public class RolloverLines : Indicator
     private bool CheckBar(int bar)
     {
         return bar >= 0 && bar < CurrentBar;
+	}
+
+    private void OnRolloverTypePropertyChanged(object sender, PropertyChangedEventArgs e)
+    {
+	    RaisePropertyChanged(nameof(RolloverType));
+
+	    if (e.PropertyName == nameof(FilterEnum<ContractRolloverType>.Value))
+		    RaisePanelPropertyChanged(Name);
     }
 
-    #endregion
+	#endregion
 }
